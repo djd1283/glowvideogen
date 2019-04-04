@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 
 class MomentsInTimeDataset(Dataset):
-    def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3):
+    def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None):
         """Dataset class loads the Moments in Time dataset, and dispenses (label, frames)
         examples."""
         super().__init__()
@@ -19,6 +19,7 @@ class MomentsInTimeDataset(Dataset):
         self.width = width
         self.height = height
         self.channels = channels
+        self.max_examples = max_examples
 
         self.examples = []
         # load dataset
@@ -36,7 +37,10 @@ class MomentsInTimeDataset(Dataset):
         shuffle(self.examples)
 
     def __len__(self):
-        return len(self.examples)
+        if self.max_examples is None:
+            return len(self.examples)
+        else:
+            return self.max_examples
 
     def __getitem__(self, idx):
         """Dispense example containing the frames of a video and the class it belongs to.

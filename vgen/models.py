@@ -11,23 +11,27 @@ class VideoGeneratorBaseline(nn.Module):
         super().__init__()
         self.im_gen = ImageGeneratorBaseline(nc_z, 6)
         self.unet = UnetGenerator(6, 3)
+        self.out = nn.Conv2d(9, 3, kernel_size=3, stride=1, padding=1, bias=False)
         self.n_frames = n_frames
 
     def forward(self, z):
         """Take input z and produce output frames."""
         two_init_frames = self.im_gen(z)
         first_frame = two_init_frames[:, :3, ...]
-        second_frame = two_init_frames[:, 3:, ...]  # two initial frames needed for motion
-        frames = [first_frame, second_frame]
+        delta = two_init_frames[:, 3:, ...]  # two initial frames needed for motion
+        frames = [first_frame, first_frame + delta]
         for i in range(self.n_frames - 2):
             prev_frame = torch.cat(frames[-2:], 1)
             assert prev_frame.shape[1] == 6  # two frames
-            next_frame = self.unet(prev_frame)
-            frames.append(next_frame)
+            next_frame_delta = self.unet(prev_frame)
+            frame_and_delta = torch.cat(frames[-2:] + [next_frame_delta], 1)
+            next_frame = self.out(frame_and_delta)
+            frames.append(frames[-1] + next_frame)
 
         assert len(frames) == self.n_frames
         video = torch.stack(frames, 1)
-        return video # b x t x c x w x h
+        # NO TANH OUTPUT AT THE MOMENT
+        return torch.tanh(video) # b x t x c x w x h
 
 
 class VideoDiscriminatorBaseline(nn.Module):
@@ -36,7 +40,7 @@ class VideoDiscriminatorBaseline(nn.Module):
         self.nc_extra = nc_extra
         self.unet = UnetGenerator(3 + nc_extra, nc_extra, use_dropout=True)
         self.predictor = nn.Conv2d(8, 1, kernel_size=1,
-                             stride=2, padding=1, bias=False)
+                             stride=2, padding=1, bias=True)
 
     def forward(self, x):
         """Take video frames and produce a prediction as to whether
@@ -58,6 +62,7 @@ class VideoDiscriminatorBaseline(nn.Module):
 
         return torch.stack(scores, 1)
 
+
 class ImageGeneratorBaseline(nn.Module):
     def __init__(self, nc_in, nc_out):
         super().__init__()
@@ -65,18 +70,18 @@ class ImageGeneratorBaseline(nn.Module):
         self.conv1 = nn.ConvTranspose2d(nc_in, 4,
                                     kernel_size=3, stride=2,
                                     padding=1, output_padding=1, bias=True)
-        self.relu1 = nn.ReLU(True)
+        self.relu1 = nn.Tanh()
 
         self.conv2 = nn.ConvTranspose2d(4, 8,
                                     kernel_size=3, stride=2,
                                     padding=1, output_padding=1,bias=True)
-        self.relu2 = nn.ReLU(True)
+        self.relu2 = nn.Tanh()
 
         self.conv3 = nn.ConvTranspose2d(8, 16,
                                     kernel_size=3, stride=1,
                                     padding=1, bias=True)
 
-        self.relu3 = nn.ReLU(True)
+        self.relu3 = nn.Tanh()
 
         self.conv4 = nn.ConvTranspose2d(16, nc_out,
                                     kernel_size=3, stride=1,
@@ -85,9 +90,9 @@ class ImageGeneratorBaseline(nn.Module):
         self.model = [self.conv1, self.relu1, self.conv2, self.relu2, self.conv3, self.relu3, self.conv4]
 
     def forward(self, z):
-        for comp in self.model:
+        for i, comp in enumerate(self.model):
             z = comp(z)
-
+            if i != len(self.model) - 1: z = z * 2
         return z
 
 
@@ -173,7 +178,7 @@ class UnetSkipConnectionBlock(nn.Module):
                                         kernel_size=3, stride=2,
                                         padding=1, output_padding=1)
             down = [downconv]
-            up = [uprelu, upconv, nn.Tanh()]
+            up = [uprelu, upconv]
             model = down + [submodule] + up
         elif innermost:
             upconv = nn.ConvTranspose2d(inner_nc, outer_nc,
