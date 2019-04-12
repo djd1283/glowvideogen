@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 
 class MomentsInTimeDataset(Dataset):
-    def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None):
+    def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None, single_example=False):
         """Dataset class loads the Moments in Time dataset, and dispenses (label, frames)
         examples."""
         super().__init__()
@@ -20,6 +20,7 @@ class MomentsInTimeDataset(Dataset):
         self.height = height
         self.channels = channels
         self.max_examples = max_examples
+        self.single_example=single_example
 
         self.examples = []
         # load dataset
@@ -36,19 +37,23 @@ class MomentsInTimeDataset(Dataset):
         # randomize
         shuffle(self.examples)
 
+        self.single_frames, self.single_label = None, None
+        if single_example:
+            label, file = self.examples[0]
+            print('filename: %s' % file)
+            self.single_label = np.array(self.labels[label], dtype=np.int)
+            self.single_frames = self.load_frames(file)
+
     def __len__(self):
         if self.max_examples is None:
             return len(self.examples)
         else:
             return self.max_examples
 
-    def __getitem__(self, idx):
-        """Dispense example containing the frames of a video and the class it belongs to.
+    def load_frames(self, file):
+        """Load frames of file from path.
 
-        :return returns tuple (label, frames) where label is zero-dim nd.array containing index of
-        class it belongs to. frames is nd.array of shape (num_frames, width, height, 3) for RGB values."""
-        label, file = self.examples[idx]
-        label_idx = np.array(self.labels[label], dtype=np.int)
+        :return Numpy array (N, C, H, W)"""
         frames = load_video(file)
         frames = frames[:self.max_timesteps]  # discard extra frames
         num_frames = frames.shape[0]
@@ -56,11 +61,24 @@ class MomentsInTimeDataset(Dataset):
         if diff > 0:
             pad = np.zeros([diff, self.width, self.height, self.channels], dtype=np.uint8)
             frames = np.concatenate([frames, pad], axis=0)
-        #convert frame to normalized float
+        # convert frame to normalized float
         frames = frames / 256.0
 
         # swap axes from TCWH to THWC to confirm with pytorch formatting
         frames = np.swapaxes(frames, 1, 3)
+        return frames
+
+    def __getitem__(self, idx):
+        """Dispense example containing the frames of a video and the class it belongs to.
+
+        :return returns tuple (label, frames) where label is zero-dim nd.array containing index of
+        class it belongs to. frames is nd.array of shape (num_frames, width, height, 3) for RGB values."""
+        if not self.single_example:
+            label, file = self.examples[idx]
+            label_idx = np.array(self.labels[label], dtype=np.int)
+            frames = self.load_frames(file)
+        else:
+            label_idx, frames = self.single_label, self.single_frames
 
         return label_idx, frames
 
