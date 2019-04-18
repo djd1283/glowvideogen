@@ -18,7 +18,7 @@ def setup():
     restore = False
     gen_path = '../data/gen.ckpt'
     disc_path = '../data/disc.ckpt'
-    n_frames = 10
+    n_frames = 1
     nc_z = 8
     device = torch.device('cuda:2')
 
@@ -43,16 +43,18 @@ def setup():
 
     return ds, gen, disc, init, nc_z, n_frames, device, gen_path, disc_path
 
-def train(ds, gen, disc, init, nc_z, device, n_frames, epochs=1, batch_size=4, lr=0.0001, n_disc_trains=0, gen_path=None, disc_path=None, tqdm_disable=False, n_slices=2):
+def train(ds, gen, disc, init, nc_z, device, n_frames, epochs=1, batch_size=4, g_lr=0.0001, d_lr=0.0001, n_disc_trains=3, gen_path=None, disc_path=None, tqdm_disable=False, n_slices=1):
+    # CHANGED LEARNING RATE
     gen.to(device)
     disc.to(device)
     init.to(device)
     gen.train()
     disc.train()
     init.train()
-    downsample = nn.AvgPool2d(3, stride=2, padding=1)
-    opt_gen = torch.optim.Adam(gen.parameters(), lr=lr, betas=(0.99, 0.999))
-    opt_disc = torch.optim.Adam(disc.parameters(), lr=lr, betas=(0.99, 0.999))
+    # CHANGING GENERATOR AND DISCRIMINATOR STRUCTURE
+    downsample = nn.AvgPool2d(16, stride=16, padding=0)
+    opt_gen = torch.optim.Adam(gen.parameters(), lr=g_lr, betas=(0.99, 0.999))
+    opt_disc = torch.optim.Adam(disc.parameters(), lr=d_lr, betas=(0.99, 0.999))
     gen_losses = []
     disc_losses = []
     for e_idx in range(epochs):
@@ -62,10 +64,12 @@ def train(ds, gen, disc, init, nc_z, device, n_frames, epochs=1, batch_size=4, l
             batch = [t.to(device) for t in batch]
             label, all_frames = batch  # ignore label for now
             all_frames = all_frames[:, :n_frames].float()
-            all_frames = downsample(all_frames.view(-1, 3, 256, 256)).view(batch_size, n_frames, 3, 128,
-                                                                             128)  # downsample to 128x128 per frame
-            rand_input = torch.randn(batch_size, nc_z, 128, 128).to(device)
+            all_frames = downsample(all_frames.view(-1, 3, 256, 256)).view(batch_size, n_frames, 3, 16, 16)  # downsample to 128x128 per frame
+            rand_input = torch.randn(batch_size, nc_z, 16, 16).to(device)
+
             pyramid = init(rand_input)  # initial the first frame feature pyramid to begin generating
+
+            epsilon = 10e-5
 
             d_slice = n_frames // n_slices
             for i in range(n_slices):
@@ -74,6 +78,7 @@ def train(ds, gen, disc, init, nc_z, device, n_frames, epochs=1, batch_size=4, l
 
                 log_idx = e_idx * len(bar) + idx
                 # load batch of examples
+                # we use vanilla GAN objective
 
                 gen_frames_tanh, pyramid = gen(pyramid, n_frames=d_slice)
                 fake_scores = disc(gen_frames_tanh)
@@ -82,10 +87,10 @@ def train(ds, gen, disc, init, nc_z, device, n_frames, epochs=1, batch_size=4, l
                 log_value('gen_frame_std', torch.std(gen_frames_tanh).item(), log_idx)
                 # train generator less than discriminator
                 if idx % (n_disc_trains + 1) == 0:
-                    # gen_loss = torch.mean((1-fake_scores)** 2)
-                    real_frames_tanh = (real_frames - 1 / 2) * 2
-                    gen_loss = torch.mean((gen_frames_tanh - real_frames_tanh) ** 2)
-
+                    #gen_loss = torch.mean((1-fake_scores)** 2)
+                    # real_frames_tanh = (real_frames - 1 / 2) * 2
+                    # gen_loss = torch.mean((gen_frames_tanh - real_frames_tanh) ** 2)
+                    gen_loss = (1+(-fake_scores).exp() + epsilon).log()
                     item_loss = gen_loss.item()
                     log_value('gen_loss', item_loss, log_idx)
                     gen_losses.append(item_loss)
@@ -100,7 +105,8 @@ def train(ds, gen, disc, init, nc_z, device, n_frames, epochs=1, batch_size=4, l
                     real_scores = disc(real_frames_tanh)
                     log_value('real_score', torch.mean(real_scores).item(), log_idx)
                     # objective for least-squares GAN
-                    disc_loss = .5 * torch.mean(fake_scores ** 2) + .5 * torch.mean((1-real_scores) ** 2)
+                    #disc_loss = .5 * torch.mean(fake_scores ** 2) + .5 * torch.mean((1-real_scores) ** 2)
+                    disc_loss = (1+(-real_scores).exp()+epsilon).log() + (1+fake_scores.exp()+epsilon).log()
                     item_loss = disc_loss.item()
                     log_value('disc_loss', item_loss, log_idx)
                     disc_losses.append(item_loss)

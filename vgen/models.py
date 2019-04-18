@@ -11,9 +11,11 @@ class VideoGeneratorBaseline(nn.Module):
         super().__init__()
         self.unet = UnetGenerator(3, 8, use_input=True)
         self.predictor = nn.Conv2d(8, 3, kernel_size=3, stride=1, padding=1, bias=True)
+        self.gen_image = nn.Parameter(torch.randn(1, 1, 3, 16, 16), requires_grad=True)
 
     def forward(self, out_pyramid, n_frames=90):
         """Take input z and produce output frames."""
+        batch_size = out_pyramid[0].shape[0]
         frame = self.predictor(out_pyramid[0])
         frames = [frame]
         for i in range(n_frames-1):
@@ -22,7 +24,9 @@ class VideoGeneratorBaseline(nn.Module):
             frames.append(frame)
 
         video = torch.stack(frames, 1)
-        return torch.tanh(video), out_pyramid # b x t x c x w x h
+        # CHANGED OUTPUT OF THIS FUNCTION TO RETURN LEARNED BIAS FRAME
+        bias_frame = self.gen_image.expand(batch_size, n_frames, -1, -1, -1)
+        return bias_frame, out_pyramid # b x t x c x w x h
 
 
 class VideoDiscriminatorBaseline(nn.Module):
@@ -30,7 +34,8 @@ class VideoDiscriminatorBaseline(nn.Module):
         super().__init__()
         self.first_frame_unet = UnetGenerator(3, 3, use_input=True, use_pyramid=False, skip_connect=False, use_dropout=True)
         self.unet = UnetGenerator(3, 3, use_input=True, use_dropout=True)
-        self.predictor = nn.Conv2d(8 * 8, 1, kernel_size=1, stride=2, padding=1, bias=True)
+        self.predictor = nn.Conv2d(8 * 8, 1, kernel_size=1, stride=2, padding=1, bias=False)
+        self.linear_predictor = nn.Linear(16 * 16 * 3, 1)
 
     def forward(self, x):
         """Take video frames and produce a prediction as to whether
@@ -38,24 +43,29 @@ class VideoDiscriminatorBaseline(nn.Module):
 
         x: torch tensor shape [batch_size, num_frames, channels, width, height]"""
         b, n_frames, nc, width, height = x.shape
-        scores = []
+        # scores = []
+        #
+        #   # batched first frame
+        #
+        # output_pyramid = None
+        # for i in range(n_frames):
+        #     if i == 0:
+        #         output_pyramid = self.first_frame_unet(x=x[:, 0])  # this one doesn't require input pyramid
+        #     else:
+        #         output_pyramid = self.unet(x=x[:, i], in_pyramid=output_pyramid)
+        #
+        #     highest_layer = output_pyramid[-1]
+        #     prediction = self.predictor(highest_layer)
+        #     # we sum across entire prediction map to get single scalar score
+        #     score = prediction.mean(-1).mean(-1).squeeze(-1) # b
+        #     scores.append(score)
 
-          # batched first frame
+        # CHANGING DISCRIMINATOR TO SIMPLE LINEAR CLASSIFIER
+        x_flat = x.reshape(b, n_frames, -1)
+        scores = self.linear_predictor(x_flat)
+        return scores.mean(1)
 
-        output_pyramid = None
-        for i in range(n_frames):
-            if i == 0:
-                output_pyramid = self.first_frame_unet(x=x[:, 0])  # this one doesn't require input pyramid
-            else:
-                output_pyramid = self.unet(x=x[:, i], in_pyramid=output_pyramid)
-
-            highest_layer = output_pyramid[-1]
-            prediction = self.predictor(highest_layer)
-            # we sum across entire prediction map to get single scalar score
-            score = prediction.mean(-1).mean(-1).squeeze(-1) # b
-            scores.append(score)
-
-        return torch.stack(scores, 1).mean(1)
+        #return torch.stack(scores, 1).mean(1)
 
 
 class ImageGeneratorBaseline(nn.Module):
@@ -67,7 +77,7 @@ class ImageGeneratorBaseline(nn.Module):
         self.unet1 = UnetGenerator(nc_in, nc_out, skip_connect=False, use_input=True, use_pyramid=False)
         unets = []
         for i in range(num_layers - 1):
-            unet = UnetGenerator(nc_in, nc_out, skip_connect=False, use_input=False)
+            unet = UnetGenerator(nc_in, nc_out, skip_connect=True, use_input=False)
             unets.append(unet)
 
         self.model = nn.ModuleList(unets)
@@ -83,7 +93,7 @@ class ImageGeneratorBaseline(nn.Module):
 class UnetGenerator(nn.Module):
     """Create a Unet-based generator"""
 
-    def __init__(self, input_nc, output_nc, num_downs=7, ngf=8, norm_layer=nn.BatchNorm2d, skip_connect=True,
+    def __init__(self, input_nc, output_nc, num_downs=4, ngf=8, norm_layer=nn.BatchNorm2d, skip_connect=True,
                  use_input=False, use_pyramid=True, use_dropout=False):
         """Construct a Unet generator
         Parameters:
@@ -98,16 +108,16 @@ class UnetGenerator(nn.Module):
         """
         super(UnetGenerator, self).__init__()
         # construct unet structure
-        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 64, input_nc=None, submodule=None, norm_layer=norm_layer, use_dropout=use_dropout,
+        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 16, input_nc=None, submodule=None, norm_layer=norm_layer, use_dropout=use_dropout,
                                              innermost=True, skip_connect=skip_connect, use_pyramid=use_pyramid)  # add the innermost layer
-        for i in range(num_downs - 5):  # add intermediate layers with ngf filters
+        for i in range(num_downs - 4):  # add intermediate layers with ngf filters
             unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, use_dropout=use_dropout,
                                                  norm_layer=norm_layer, skip_connect=skip_connect, use_pyramid=use_pyramid)
         # gradually reduce the number of filters from ngf * 8 to ngf
         unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, use_dropout=use_dropout,
                                              norm_layer=norm_layer, skip_connect=skip_connect, use_pyramid=use_pyramid)
-        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout,
-                                             norm_layer=norm_layer, skip_connect=skip_connect, use_pyramid=use_pyramid)
+        # unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout,
+        #                                      norm_layer=norm_layer, skip_connect=skip_connect, use_pyramid=use_pyramid)
         unet_block = UnetSkipConnectionBlock(ngf, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer,
                                              skip_connect=skip_connect, use_pyramid=use_pyramid, use_dropout=use_dropout)
         self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True,
@@ -141,6 +151,7 @@ class UnetSkipConnectionBlock(nn.Module):
         """
         super(UnetSkipConnectionBlock, self).__init__()
         self.outermost = outermost
+        self.innermost = innermost
         self.submodule = submodule
         self.outputs = None
         self.use_input = use_input
@@ -168,6 +179,7 @@ class UnetSkipConnectionBlock(nn.Module):
         downrelu = nn.LeakyReLU(0.2, True)
         self.tanh = nn.Tanh()
         downnorm = norm_layer(inner_nc)
+        self.drop = nn.Dropout(0.7)
         self.uprelu = nn.ReLU(True)
         self.upnorm = norm_layer(outer_nc)
 
@@ -190,10 +202,11 @@ class UnetSkipConnectionBlock(nn.Module):
                                         kernel_size=3, stride=2,
                                         padding=1, output_padding=1, bias=use_bias)
             down = [downrelu, downconv]
-            if use_dropout:
-                up = [self.uprelu, upconv, nn.Dropout(0.7)]
-            else:
-                up = [self.uprelu, upconv]
+            up = [self.uprelu, upconv]
+
+        if use_dropout:
+            down = down + [self.drop]
+            up = up + [self.drop]
 
         self.out = nn.Conv2d(in_size + outer_nc, outer_nc, kernel_size=3,
                              stride=1, bias=use_bias, padding=1)
@@ -252,8 +265,8 @@ class UnetSkipConnectionBlock(nn.Module):
             next_layer = state + next_layer
 
         # normalize output
-        if not self.outermost:
-            next_layer = self.upnorm(next_layer)
+        # if not self.outermost and not self.innermost:
+        #     next_layer = self.upnorm(next_layer)
 
         out_pyramid = [next_layer] + out_pyramid  # slip layer onto bottom of abstract state pyramid
 
