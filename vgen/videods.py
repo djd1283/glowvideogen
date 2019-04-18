@@ -62,7 +62,7 @@ class MomentsInTimeDataset(Dataset):
             pad = np.zeros([diff, self.width, self.height, self.channels], dtype=np.uint8)
             frames = np.concatenate([frames, pad], axis=0)
         # convert frame to normalized float
-        frames = frames / 256.0
+        frames = (frames / 256.0).astype(np.float32)
 
         # swap axes from TCWH to THWC to confirm with pytorch formatting
         frames = np.swapaxes(frames, 1, 3)
