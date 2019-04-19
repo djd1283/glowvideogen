@@ -104,10 +104,11 @@ def calc_loss(log_p, logdet, image_size, n_bins):
     )
 
 
-def train(args, model, optimizer):
+def train(args, head_model, tail_model, optimizer):
+    """Head model produces the first frame of the video. Tail model produces the rest of the frames."""
     # Load dataset of images
     #dataset = iter(sample_data(args.path, args.batch, args.img_size))
-    ds = MomentsInTimeDataset('../data/momentsintime/training')
+    ds = MomentsInTimeDataset('../data/momentsintime/training', single_example=True)
     dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
     downsample = nn.AvgPool2d(4, stride=4, padding=0).to(device)
     n_bins = 2. ** args.n_bits
@@ -130,16 +131,8 @@ def train(args, model, optimizer):
         log_value('video_mean', frames.mean().item(), i)
         image = frames[:, 0]
         image = downsample(image)
-        args.img_size = image.shape[-1]
-        #tail_frames = frames[:, 1:]
-        #image = image_old
-        #image = downsample(image)
-        #image = image - 0.5  # normalize
-        # Run image through model
-        # For first batch, run everything through one GPU - normalization requires full batch for statistics
-        # Noise added to input to increase generalization
-        # if False:
-        #    log_p, logdet = model.module(image + torch.rand_like(image) / n_bins)
+        tail_frames = frames[:, 1:]
+
         log_p, logdet = model(image + torch.rand_like(image) / n_bins)
 
         loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
@@ -187,11 +180,13 @@ if __name__ == '__main__':
     rmtree('sample/')
     os.makedirs('sample/')
 
-    first_frame_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu)
-    first_frame_model = first_frame_model.to(device)
+    head_frame_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu)
+    head_frame_model = head_frame_model.to(device)
+    tail_frame_model = Glow(3, args.n_flow // 4, args.n_block // 2, affine=args.affine, conv_lu=not args.no_lu)
+    tail_frame_model = tail_frame_model.to(device)
     #model = nn.DataParallel(model_single)
     # model = model_single
 
-    optimizer = optim.Adam(first_frame_model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(list(head_frame_model.parameters()) + list(tail_frame_model.parameters()), lr=args.lr)
 
-    train(args, first_frame_model, optimizer)
+    train(args, head_frame_model, tail_frame_model, optimizer)
