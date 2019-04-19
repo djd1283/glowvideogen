@@ -48,22 +48,17 @@ parser.add_argument('--path', metavar='PATH', type=str, help='Path to image dire
 
 # SET TEMPERATURE TO 1 WHEN MODELLING ONLY ONE IMAGE - IT SHOULD BE AT THE CENTER
 
-def get_transforms(image_size):
+def sample_data(path, batch_size, image_size):
     transform = transforms.Compose(
         [
-            transforms.ToPILImage(None),
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (1, 1, 1)),
         ]
     )
-    return transform
 
-
-# LOOK OUT FOR THIS! COULD ADD DISTORTIONS IN-BETWEEN FRAMES OF VIDEO
-def sample_data(path, batch_size, image_size):
-    transform = get_transforms(image_size)
     dataset = datasets.ImageFolder(path, transform=transform)
     loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4)
     loader = iter(loader)
@@ -112,11 +107,9 @@ def calc_loss(log_p, logdet, image_size, n_bins):
 def train(args, model, optimizer):
     # Load dataset of images
     #dataset = iter(sample_data(args.path, args.batch, args.img_size))
-    print(next(model.parameters()).device)
-    transform = get_transforms(args.img_size)
-    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=None, single_example=True, transform=transform)
+    ds = MomentsInTimeDataset('../data/momentsintime/training')
     dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
-    # downsample = nn.AvgPool2d(4, stride=4, padding=0).to(device)
+    downsample = nn.AvgPool2d(4, stride=4, padding=0).to(device)
     n_bins = 2. ** args.n_bits
 
     # Determine sizes of each layer
@@ -132,10 +125,13 @@ def train(args, model, optimizer):
         #image_old = image_old.to(device)
         batch = [t.to(device) for t in batch]
         label, frames = batch
+        frames = frames - 0.5 # normalize to range (-0.5, +0.5)
         log_value('video_std', frames.std().item(), i)
         log_value('video_mean', frames.mean().item(), i)
         image = frames[:, 0]
-        tail_frames = frames[:, 1:]
+        image = downsample(image)
+        args.img_size = image.shape[-1]
+        #tail_frames = frames[:, 1:]
         #image = image_old
         #image = downsample(image)
         #image = image - 0.5  # normalize

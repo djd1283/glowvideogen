@@ -68,11 +68,12 @@ class MomentsInTimeDataset(Dataset):
         frames = np.swapaxes(frames, 1, 3)
 
         # if transform provided, use it on every frame
-        transformed_frames = []
+
         if self.transform is not None:
+            transformed_frames = []
             for i in range(frames.shape[0]):
                 transformed_frames.append(self.transform(frames[i]))
-        frames = np.stack(transformed_frames, 0)
+            frames = np.stack(transformed_frames, 0)
 
         # convert frame to normalized float
         frames = (frames / 256.0).astype(np.float32)
