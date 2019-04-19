@@ -1,5 +1,7 @@
 """Used from https://github.com/rosinality/glow-pytorch for class project. Thank you!"""
 
+from shutil import rmtree
+import os
 from tqdm import tqdm
 import numpy as np
 from PIL import Image
@@ -15,6 +17,10 @@ from torchvision import datasets, transforms, utils
 
 from vgen.glowmodel import Glow
 from vgen.videods import MomentsInTimeDataset
+from tensorboard_logger import log_value, configure
+import datetime
+
+configure('logdir/' + str(datetime.datetime.now()))
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -33,26 +39,31 @@ parser.add_argument(
 parser.add_argument(
     '--affine', action='store_true', help='use affine coupling instead of additive'
 )
-parser.add_argument('--n_bits', default=5, type=int, help='number of bits')
+parser.add_argument('--n_bits', default=8, type=int, help='number of bits')
 parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
 parser.add_argument('--img_size', default=64, type=int, help='image size')
 parser.add_argument('--temp', default=0.7, type=float, help='temperature of sampling')
 parser.add_argument('--n_sample', default=20, type=int, help='number of samples')
 parser.add_argument('--path', metavar='PATH', type=str, help='Path to image directory')
 
+# SET TEMPERATURE TO 1 WHEN MODELLING ONLY ONE IMAGE - IT SHOULD BE AT THE CENTER
 
-# LOOK OUT FOR THIS! COULD ADD DISTORTIONS IN-BETWEEN FRAMES OF VIDEO
-def sample_data(path, batch_size, image_size):
+def get_transforms(image_size):
     transform = transforms.Compose(
         [
+            transforms.ToPILImage(None),
             transforms.Resize(image_size),
             transforms.CenterCrop(image_size),
-            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (1, 1, 1)),
         ]
     )
+    return transform
 
+
+# LOOK OUT FOR THIS! COULD ADD DISTORTIONS IN-BETWEEN FRAMES OF VIDEO
+def sample_data(path, batch_size, image_size):
+    transform = get_transforms(image_size)
     dataset = datasets.ImageFolder(path, transform=transform)
     loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4)
     loader = iter(loader)
@@ -101,9 +112,11 @@ def calc_loss(log_p, logdet, image_size, n_bins):
 def train(args, model, optimizer):
     # Load dataset of images
     #dataset = iter(sample_data(args.path, args.batch, args.img_size))
-    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=None, single_example=True)
-    dl = DataLoader(ds, num_workers=3)
-    downsample = nn.AvgPool2d(4, stride=4, padding=0)
+    print(next(model.parameters()).device)
+    transform = get_transforms(args.img_size)
+    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=None, single_example=True, transform=transform)
+    dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
+    # downsample = nn.AvgPool2d(4, stride=4, padding=0).to(device)
     n_bins = 2. ** args.n_bits
 
     # Determine sizes of each layer
@@ -117,18 +130,21 @@ def train(args, model, optimizer):
     for i, batch in enumerate(pbar):
         #image_old, _ = next(dataset)
         #image_old = image_old.to(device)
-        [t.to(device) for t in batch]
+        batch = [t.to(device) for t in batch]
         label, frames = batch
+        log_value('video_std', frames.std().item(), i)
+        log_value('video_mean', frames.mean().item(), i)
         image = frames[:, 0]
-        image = downsample(image)
-        image = image - 0.5  # normalize
+        tail_frames = frames[:, 1:]
+        #image = image_old
+        #image = downsample(image)
+        #image = image - 0.5  # normalize
         # Run image through model
         # For first batch, run everything through one GPU - normalization requires full batch for statistics
         # Noise added to input to increase generalization
-        if False:
-           log_p, logdet = model.module(image + torch.rand_like(image) / n_bins)
-        else:
-            log_p, logdet = model(image + torch.rand_like(image) / n_bins)
+        # if False:
+        #    log_p, logdet = model.module(image + torch.rand_like(image) / n_bins)
+        log_p, logdet = model(image + torch.rand_like(image) / n_bins)
 
         loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
         model.zero_grad()
@@ -142,11 +158,18 @@ def train(args, model, optimizer):
             f'Loss: {loss.item():.5f}; logP: {log_p.item():.5f}; logdet: {log_det.item():.5f}; lr: {warmup_lr:.7f}'
         )
 
-        if i % 100 == 0:
+        if i % 100 == 0 or i == 0:
             with torch.no_grad():
                 utils.save_image(
-                    model_single.reverse(z_sample).cpu().data,
+                    model.reverse(z_sample).cpu().data,
                     f'sample/{str(i + 1).zfill(6)}.png',
+                    normalize=True,
+                    nrow=10,
+                    range=(-0.5, 0.5),
+                )
+                utils.save_image(
+                    image.cpu().data,
+                    f'sample/{str(i + 1).zfill(6)}_real.png',
                     normalize=True,
                     nrow=10,
                     range=(-0.5, 0.5),
@@ -165,13 +188,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     print(args)
 
-    model_single = Glow(
-        3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu
-    )
+    rmtree('sample/')
+    os.makedirs('sample/')
+
+    first_frame_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu)
+    first_frame_model = first_frame_model.to(device)
     #model = nn.DataParallel(model_single)
     # model = model_single
-    model = model_single.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(first_frame_model.parameters(), lr=args.lr)
 
-    train(args, model, optimizer)
+    train(args, first_frame_model, optimizer)

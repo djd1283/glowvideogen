@@ -8,7 +8,8 @@ from tqdm import tqdm
 
 
 class MomentsInTimeDataset(Dataset):
-    def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None, single_example=False):
+    def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None,
+                 single_example=False, transform=None):
         """Dataset class loads the Moments in Time dataset, and dispenses (label, frames)
         examples."""
         super().__init__()
@@ -21,6 +22,7 @@ class MomentsInTimeDataset(Dataset):
         self.channels = channels
         self.max_examples = max_examples
         self.single_example=single_example
+        self.transform = transform
 
         self.examples = []
         # load dataset
@@ -61,11 +63,20 @@ class MomentsInTimeDataset(Dataset):
         if diff > 0:
             pad = np.zeros([diff, self.width, self.height, self.channels], dtype=np.uint8)
             frames = np.concatenate([frames, pad], axis=0)
-        # convert frame to normalized float
-        frames = (frames / 256.0).astype(np.float32)
 
         # swap axes from TCWH to THWC to confirm with pytorch formatting
         frames = np.swapaxes(frames, 1, 3)
+
+        # if transform provided, use it on every frame
+        transformed_frames = []
+        if self.transform is not None:
+            for i in range(frames.shape[0]):
+                transformed_frames.append(self.transform(frames[i]))
+        frames = np.stack(transformed_frames, 0)
+
+        # convert frame to normalized float
+        frames = (frames / 256.0).astype(np.float32)
+
         return frames
 
     def __getitem__(self, idx):
