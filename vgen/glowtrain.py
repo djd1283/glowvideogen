@@ -45,6 +45,8 @@ parser.add_argument('--img_size', default=64, type=int, help='image size')
 parser.add_argument('--temp', default=0.7, type=float, help='temperature of sampling')
 parser.add_argument('--n_sample', default=20, type=int, help='number of samples')
 parser.add_argument('--path', metavar='PATH', type=str, help='Path to image directory')
+parser.add_argument('--n_frames', default=90, type=int, help='max number of video frames')
+
 
 # SET TEMPERATURE TO 1 WHEN MODELLING ONLY ONE IMAGE - IT SHOULD BE AT THE CENTER
 
@@ -133,15 +135,22 @@ def train(args, head_model, tail_model, optimizer):
         image = downsample(image)
         tail_frames = frames[:, 1:]
 
-        log_p, logdet = model(image + torch.rand_like(image) / n_bins)
+        def train_on_frame(model, im):
+            log_p, logdet = model(im + torch.rand_like(im) / n_bins)
+            loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
+            optimizer.zero_grad()
+            loss.backward()
+            warmup_lr = args.lr
+            optimizer.param_groups[0]['lr'] = warmup_lr
+            optimizer.step()
 
-        loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
-        model.zero_grad()
-        loss.backward()
+        train_on_frame(head_model, image)
+        for i in range(tail_frames.shape[1]):
+            # Now we generate all the rest of the frames
+            frame = downsample(tail_frames[:, i])
+            train_on_frame(tail_model, frame)
+        
         # warmup_lr = args.lr * min(1, i * batch_size / (50000 * 10))
-        warmup_lr = args.lr
-        optimizer.param_groups[0]['lr'] = warmup_lr
-        optimizer.step()
 
         pbar.set_description(
             f'Loss: {loss.item():.5f}; logP: {log_p.item():.5f}; logdet: {log_det.item():.5f}; lr: {warmup_lr:.7f}'
@@ -150,7 +159,7 @@ def train(args, head_model, tail_model, optimizer):
         if i % 100 == 0 or i == 0:
             with torch.no_grad():
                 utils.save_image(
-                    model.reverse(z_sample).cpu().data,
+                    head_model.reverse(z_sample).cpu().data,
                     f'sample/{str(i + 1).zfill(6)}.png',
                     normalize=True,
                     nrow=10,
@@ -164,9 +173,10 @@ def train(args, head_model, tail_model, optimizer):
                     range=(-0.5, 0.5),
                 )
 
+        # CURRENTLY NOT SAVING TAIL MODEL
         if i % 10000 == 0:
             torch.save(
-                model.state_dict(), f'checkpoint/model_{str(i + 1).zfill(6)}.pt'
+                head_model.state_dict(), f'checkpoint/model_{str(i + 1).zfill(6)}.pt'
             )
             torch.save(
                 optimizer.state_dict(), f'checkpoint/optim_{str(i + 1).zfill(6)}.pt'
