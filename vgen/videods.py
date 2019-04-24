@@ -63,12 +63,11 @@ class MomentsInTimeDataset(Dataset):
         if diff > 0:
             pad = np.zeros([diff, self.width, self.height, self.channels], dtype=np.uint8)
             frames = np.concatenate([frames, pad], axis=0)
-
-        # swap axes from TCWH to THWC to confirm with pytorch formatting
-        frames = np.swapaxes(frames, 1, 3)
+        # swap axes from TWHC to TCHW to conform with pytorch formatting
+        frames = np.transpose(frames, (0, 3, 1, 2))
+        #frames = np.swapaxes(frames, 3, 2)
 
         # if transform provided, use it on every frame
-
         if self.transform is not None:
             transformed_frames = []
             for i in range(frames.shape[0]):
@@ -110,6 +109,20 @@ def load_video(filename):
         frames.append(frame)
 
     return np.stack(frames, axis=0)
+
+
+def write_video(filename, data):
+    """
+    Write numpy array to disk as video.
+
+    :param filename Name of location on disk to save video file
+    :param data nd.array (type np.uint8) shape (num_frames, width, heigh, 3)
+    """
+    writer = skvideo.io.FFmpegWriter(filename, inputdict={'-r': '30'})
+    for i in range(data.shape[0]):
+        writer.writeFrame(data[i, :, :, :])
+    writer.close()
+
 
 if __name__ == '__main__':
     ds = MomentsInTimeDataset('../data/momentsintime/training')
