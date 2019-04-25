@@ -154,13 +154,13 @@ class ZeroConv2d(nn.Module):
 
 
 class AffineCoupling(nn.Module):
-    def __init__(self, in_channel, filter_size=512, affine=True):
+    def __init__(self, in_channel, filter_size=512, affine=True, nc_ctx=0):
         super().__init__()
-
+        self.nc_ctx = nc_ctx
         self.affine = affine
 
         self.net = nn.Sequential(
-            nn.Conv2d(in_channel // 2, filter_size, 3, padding=1),
+            nn.Conv2d(in_channel // 2 + nc_ctx, filter_size, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(filter_size, filter_size, 1),
             nn.ReLU(),
@@ -173,11 +173,16 @@ class AffineCoupling(nn.Module):
         self.net[2].weight.data.normal_(0, 0.05)
         self.net[2].bias.data.zero_()
 
-    def forward(self, input):
+    def forward(self, input, ctx=None):
         in_a, in_b = input.chunk(2, 1)
 
         if self.affine:
-            log_s, t = self.net(in_a).chunk(2, 1)
+            if ctx is None:
+                log_s, t = self.net(in_a).chunk(2, 1)
+            else:
+                assert self.nc_ctx > 0
+                # add context to input of affine coupling - conditional glow!
+                log_s, t = self.net(torch.cat([in_a, ctx], 1)).chunk(2, 1)
             # s = torch.exp(log_s)
             s = F.sigmoid(log_s + 2)
             # out_a = s * in_a + t
@@ -186,31 +191,48 @@ class AffineCoupling(nn.Module):
             logdet = torch.sum(torch.log(s).view(input.shape[0], -1), 1)
 
         else:
-            net_out = self.net(in_a)
+            if ctx is None:
+                net_out = self.net(in_a)
+            else:
+                assert self.nc_ctx > 0
+                # add context to input of affine coupling - conditional glow!
+                net_out = self.net(torch.cat([in_a, ctx], 1))
+            #net_out = self.net(in_a)
             out_b = in_b + net_out
             logdet = None
 
         return torch.cat([in_a, out_b], 1), logdet
 
-    def reverse(self, output):
+    def reverse(self, output, ctx=None):
         out_a, out_b = output.chunk(2, 1)
 
         if self.affine:
-            log_s, t = self.net(out_a).chunk(2, 1)
+            if ctx is None:
+                log_s, t = self.net(out_a).chunk(2, 1)
+            else:
+                assert self.nc_ctx > 0
+                # add context to input of affine coupling - conditional glow!
+                log_s, t = self.net(torch.cat([out_a, ctx], -1))
             # s = torch.exp(log_s)
             s = F.sigmoid(log_s + 2)
             # in_a = (out_a - t) / s
             in_b = out_b / s - t
 
         else:
-            net_out = self.net(out_a)
+            if ctx is None:
+                net_out = self.net(out_a)
+            else:
+                assert self.nc_ctx > 0
+                # add context to input of affine coupling - conditional glow!
+                net_out = self.net(torch.cat([out_a, ctx], 1))
+            # net_out = self.net(out_a)
             in_b = out_b - net_out
 
         return torch.cat([out_a, in_b], 1)
 
 
 class Flow(nn.Module):
-    def __init__(self, in_channel, affine=True, conv_lu=True):
+    def __init__(self, in_channel, affine=True, conv_lu=True, nc_ctx=0):
         super().__init__()
 
         self.actnorm = ActNorm(in_channel)
@@ -221,12 +243,12 @@ class Flow(nn.Module):
         else:
             self.invconv = InvConv2d(in_channel)
 
-        self.coupling = AffineCoupling(in_channel, affine=affine)
+        self.coupling = AffineCoupling(in_channel, affine=affine, nc_ctx=nc_ctx)
 
-    def forward(self, input):
+    def forward(self, input, ctx=None):
         out, logdet = self.actnorm(input)
         out, det1 = self.invconv(out)
-        out, det2 = self.coupling(out)
+        out, det2 = self.coupling(out, ctx=ctx)
 
         logdet = logdet + det1
         if det2 is not None:
@@ -234,8 +256,8 @@ class Flow(nn.Module):
 
         return out, logdet
 
-    def reverse(self, output):
-        input = self.coupling.reverse(output)
+    def reverse(self, output, ctx=None):
+        input = self.coupling.reverse(output, ctx=ctx)
         input = self.invconv.reverse(input)
         input = self.actnorm.reverse(input)
 
@@ -250,16 +272,34 @@ def gaussian_log_p(x, mean, log_sd):
 def gaussian_sample(eps, mean, log_sd):
     return mean + torch.exp(log_sd) * eps
 
+def squeeze_image(input):
+    """Half the width and height of the image, but expand the number of channels by 4."""
+    b_size, n_channel, height, width = input.shape
+    squeezed = input.view(b_size, n_channel, height // 2, 2, width // 2, 2)
+    squeezed = squeezed.permute(0, 1, 3, 5, 2, 4)
+    out = squeezed.contiguous().view(b_size, n_channel * 4, height // 2, width // 2)
+    return out
+
+def unsqueeze_image(input):
+    """Reduce the number of channels by 4, but double the width and height of the image. Inverse operation
+    of squeeze_image()."""
+    b_size, n_channel, height, width = input.shape
+    unsqueezed = input.view(b_size, n_channel // 4, 2, 2, height, width)
+    unsqueezed = unsqueezed.permute(0, 1, 4, 2, 5, 3)
+    unsqueezed = unsqueezed.contiguous().view(
+        b_size, n_channel // 4, height * 2, width * 2
+    )
+    return unsqueezed
 
 class Block(nn.Module):
-    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True):
+    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True, nc_ctx=0):
         super().__init__()
 
         squeeze_dim = in_channel * 4
 
         self.flows = nn.ModuleList()
         for i in range(n_flow):
-            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu))
+            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx))
 
         self.split = split
 
@@ -269,16 +309,14 @@ class Block(nn.Module):
         else:
             self.prior = ZeroConv2d(in_channel * 4, in_channel * 8)
 
-    def forward(self, input):
-        b_size, n_channel, height, width = input.shape
-        squeezed = input.view(b_size, n_channel, height // 2, 2, width // 2, 2)
-        squeezed = squeezed.permute(0, 1, 3, 5, 2, 4)
-        out = squeezed.contiguous().view(b_size, n_channel * 4, height // 2, width // 2)
+    def forward(self, input, ctx=None):
+        b_size = input.shape[0]
+        out = squeeze_image(input)
 
         logdet = 0
 
         for flow in self.flows:
-            out, det = flow(out)
+            out, det = flow(out, ctx=ctx)
             logdet = logdet + det
 
         if self.split:
@@ -296,7 +334,7 @@ class Block(nn.Module):
 
         return out, logdet, log_p
 
-    def reverse(self, output, eps=None):
+    def reverse(self, output, eps=None, ctx=None):
         input = output
 
         if self.split:
@@ -312,37 +350,52 @@ class Block(nn.Module):
             input = z
 
         for flow in self.flows[::-1]:
-            input = flow.reverse(input)
+            input = flow.reverse(input, ctx=ctx)
 
-        b_size, n_channel, height, width = input.shape
-
-        unsqueezed = input.view(b_size, n_channel // 4, 2, 2, height, width)
-        unsqueezed = unsqueezed.permute(0, 1, 4, 2, 5, 3)
-        unsqueezed = unsqueezed.contiguous().view(
-            b_size, n_channel // 4, height * 2, width * 2
-        )
+        unsqueezed = unsqueeze_image(input)
 
         return unsqueezed
 
 
 class Glow(nn.Module):
-    def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True):
+    def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True, nc_ctx=0):
         super().__init__()
+        if nc_ctx > 0:
+            self.ctx_downs = nn.ModuleList(
+                [nn.Conv2d(nc_ctx * 4, nc_ctx, 3, stride=1, padding=2, dilation=2)
+                 for i in range(n_block-1)])
+            self.relu = nn.ReLU()
 
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
-            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu))
+            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx * 4))
             n_channel *= 2
-        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine))
+        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine, nc_ctx=nc_ctx * 4))
 
-    def forward(self, input):
+    def build_ctx_pyramid(self, ctx):
+        # construct a pyramid from input context
+        ctx_pyramid = None
+        if ctx is not None:
+            ctx_pyramid = [squeeze_image(ctx)]  # nc_ctx * 4
+            for down in self.ctx_downs:
+                layer = down(ctx_pyramid[-1])  # nc_ctx * 2
+                layer = squeeze_image(layer)  # nc_ctx * 8
+                layer = self.relu(layer)  # activation not applied to input image
+                ctx_pyramid.append(layer)  # ctx_pyramid[-1] -> nc_ctx * 8
+        return ctx_pyramid
+
+    def forward(self, input, ctx=None):
         log_p_sum = 0
         logdet = 0
         out = input
 
-        for block in self.blocks:
-            out, det, log_p = block(out)
+        if ctx is not None:
+            ctx_pyramid = self.build_ctx_pyramid(ctx)
+
+        for i, block in enumerate(self.blocks):
+            ctx_in = None if ctx is None else ctx_pyramid[i]
+            out, det, log_p = block(out, ctx=ctx_in)
             logdet = logdet + det
 
             if log_p is not None:
@@ -350,12 +403,46 @@ class Glow(nn.Module):
 
         return log_p_sum, logdet
 
-    def reverse(self, z_list):
+    def reverse(self, z_list, ctx=None):
+
+        if ctx is not None:
+            ctx_pyramid = self.build_ctx_pyramid(ctx)
+            ctx_pyramid.reverse()  # we are introducing pyramid in reverse order now
+
         for i, block in enumerate(self.blocks[::-1]):
+            ctx_in = None if ctx is None else ctx_pyramid[i]
             if i == 0:
-                input = block.reverse(z_list[-1], z_list[-1])
+                input = block.reverse(z_list[-1], z_list[-1], ctx=ctx_in)
 
             else:
-                input = block.reverse(input, z_list[-(i + 1)])
+                input = block.reverse(input, z_list[-(i + 1)], ctx=ctx_in)
 
         return input
+
+
+class ContextProcessor(nn.Module):
+    def __init__(self, nc_frame, nc_state):
+        super().__init__()
+        self.conv1 = nn.Conv2d(nc_frame + nc_state, nc_state, 3, stride=1, padding=2, dilation=1)
+        self.conv2 = nn.Conv2d(nc_state, nc_state, 3, stride=1, padding=2, dilation=1)
+        self.relu = nn.ReLU()
+
+
+    def forward(self, frame, state):
+        """Process frame and state into new state."""
+        both = torch.cat([frame, state], dim=1)  # cat along channel dimension
+        delta = self.conv2(self.relu(self.conv1(both)))
+        return state + delta
+
+
+
+
+
+
+
+
+
+
+
+
+
