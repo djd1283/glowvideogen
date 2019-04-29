@@ -128,7 +128,8 @@ def generate_video(head_model, tail_model, n_frames, img_size, n_flow, n_block, 
     image = generate_image(head_model, img_size, n_flow, n_block, 1, temp)
     frames = [image]
     for i in range(n_frames-1):
-        frame = generate_image(tail_model, img_size, n_flow // 32, n_block, 1, temp, ctx=frames[-1])
+        delta = generate_image(tail_model, img_size, n_flow // 32, n_block, 1, temp, ctx=frames[-1])
+        frame = frames[-1] + delta
         frames.append(frame)
     result = torch.stack(frames, dim=1).squeeze(0)
     return result
@@ -161,7 +162,8 @@ def train_on_video(head_model, tail_model, frames, head_optimizer, tail_optimize
     for j in range(frames.shape[1] - 1):
         prev_frame = frames[:, j]
         frame = frames[:, j + 1]
-        log_p, logdet = tail_model(frame + torch.rand_like(frame) / n_bins, ctx=prev_frame)
+        delta = frame - prev_frame  # we will produce the difference
+        log_p, logdet = tail_model(delta + torch.rand_like(frame) / n_bins, ctx=prev_frame)
         loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
         losses.append(loss)
 
@@ -172,14 +174,22 @@ def train_on_video(head_model, tail_model, frames, head_optimizer, tail_optimize
     return total_loss, first_loss, first_log_p, first_log_det
 
 
-def train(args, head_model, tail_model, ctx_proc, n_epochs=1, n_frames=30, max_examples=None):
+def restore_models_optimizers_from_save(head_model, tail_model, ctx_proc, head_optim, tail_optim):
+    """Restore all models and optimizers from save."""
+    head_model.load_state_dict(torch.load(f'checkpoint/headmodel.pt'))
+    tail_model.load_state_dict(torch.load(f'checkpoint/tailmodel.pt'))
+    ctx_proc.load_state_dict(torch.load(f'checkpoint/ctxmodel.pt'))
+    head_optim.load_state_dict(torch.load('checkpoint/head_optim.pt'))
+    tail_optim.load_state_dict(torch.load('checkpoint/tail_optim.pt'))
+
+
+def train(args, head_model, tail_model, ctx_proc, head_optimizer, tail_optimizer, n_epochs=1, n_frames=30, max_examples=None):
     """Head model produces the first frame of the video. Tail model produces the rest of the frames."""
     # Load dataset of images
     #dataset = iter(sample_data(args.path, args.batch, args.img_size))
-    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=max_examples)
+    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=max_examples, seed=1212)
+    val_ds = ds.split(0.9) # grab 10% of examples as validation set
     dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
-    head_optimizer = optim.Adam(head_model.parameters(), lr=args.lr)
-    tail_optimizer = optim.Adam(list(tail_model.parameters()) + list(ctx_proc.parameters()), lr=args.lr)
     down_x = 256 // args.img_size
     downsample = nn.AvgPool2d(down_x, stride=down_x, padding=0).to(device)
     n_bins = 2. ** args.n_bits
@@ -199,6 +209,7 @@ def train(args, head_model, tail_model, ctx_proc, n_epochs=1, n_frames=30, max_e
             label, frames = batch
             frames = frames[:, :n_frames]
             frames = frames - 0.5 # normalize to range (-0.5, +0.5)
+
             log_value('video_std', frames.std().item(), i)
             log_value('video_mean', frames.mean().item(), i)
             # downsample all frames to make them easier to generate
@@ -206,6 +217,8 @@ def train(args, head_model, tail_model, ctx_proc, n_epochs=1, n_frames=30, max_e
 
             image = frames[:, 0]
             tail_frames = frames[:, 1:]
+
+            #TODO condition on state information, instead of previous frame only
 
             video_loss, loss, log_p, log_det = train_on_video(head_model, tail_model, frames, head_optimizer, tail_optimizer, n_bins)
             #loss, log_p, log_det = train_on_first_frame(head_model, image, head_optimizer, n_bins)
@@ -223,10 +236,16 @@ def train(args, head_model, tail_model, ctx_proc, n_epochs=1, n_frames=30, max_e
 
             if i % 100 == 0 or i == 0:
                 with torch.no_grad():
+
+                    # NaN failsafe: if we detect Nan loss, restore previous checkpoint
+                    if loss.item() != loss.item() or video_loss.item() != video_loss.item():
+                        alert.write('glowtrain.py: NaN detected! Restoring last save')
+                        restore_models_optimizers_from_save(head_model, tail_model, ctx_proc, head_optimizer, tail_optimizer)
+
+
                     head_model.eval()
                     tail_model.eval()
                     ctx_proc.eval()
-                    # TODO: Add eval() function and debug why videos are different than corresponding images
                     gen_image = generate_image(head_model, args.img_size, args.n_flow, args.n_block, args.n_sample,
                                                args.temp)
                     gen_image = gen_image.cpu()
@@ -234,21 +253,21 @@ def train(args, head_model, tail_model, ctx_proc, n_epochs=1, n_frames=30, max_e
                     if args.video_path is not None:
                         gen_video = generate_video(head_model, tail_model, n_frames, args.img_size, args.n_flow, args.n_block, args.temp)
                         gen_video = np.transpose(gen_video.cpu().numpy(), [0, 2, 3, 1])
-                        gen_video = ((gen_video / 2 + 1) * 256)
+                        gen_video = ((gen_video + 0.5) * 256.0)
                         gen_video = gen_video.clip(0, 255).astype(np.uint8)
                         # Save all generated video samples to disk
                         write_video(os.path.join(args.video_path, 'video_' + str(img_count) + '.mp4'), gen_video)
 
                     utils.save_image(
                         gen_image,
-                        f'sample/{str(img_count).zfill(6)}.png',
+                        f'sample/{str(img_count).zfill(4)}.png',
                         normalize=True,
                         nrow=10,
                         range=(-0.5, 0.5),
                     )
                     utils.save_image(
                         image.cpu().data,
-                        f'sample/{str(img_count).zfill(6)}_real.png',
+                        f'sample/{str(img_count).zfill(4)}_real.png',
                         normalize=True,
                         nrow=10,
                         range=(-0.5, 0.5),
@@ -256,37 +275,44 @@ def train(args, head_model, tail_model, ctx_proc, n_epochs=1, n_frames=30, max_e
                     img_count += 1
 
             if i % 10000 == 0:
-                torch.save(head_model.state_dict(), f'checkpoint/headmodel.pt')
-                torch.save(tail_model.state_dict(), f'checkpoint/tailmodel.pt')
-                torch.save(ctx_proc.state_dict(), f'checkpoint/ctxmodel.pt')
+                torch.save(head_model.state_dict(), 'checkpoint/headmodel.pt')
+                torch.save(tail_model.state_dict(), 'checkpoint/tailmodel.pt')
+                torch.save(ctx_proc.state_dict(), 'checkpoint/ctxmodel.pt')
+                torch.save(head_optimizer.state_dict(), 'checkpoint/head_optim.pt')
+                torch.save(tail_optimizer.state_dict(), 'checkpoint/tail_optim.pt')
 
 if __name__ == '__main__':
+    #print('Detecting NaN anomalies')
+    #with torch.autograd.set_detect_anomaly(True):
     args = parser.parse_args()
     print(args)
 
     # delete all .png images in sample folder
     [os.remove(f) for f in glob.glob('sample/*.png')]
 
-    # if video path specified, delete all .mp4s!!!!!!
+    # create folder if it doesn't exist for video samples
     if args.video_path is not None and not os.path.exists(args.video_path):
+        os.makedirs(args.video_path)
+
+    # if video path specified, delete all .mp4s!!!!!!
+    if args.video_path is not None:
         [os.remove(f) for f in glob.glob(os.path.join(args.video_path, '*.mp4'))]
 
-    head_frame_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu)
-    head_frame_model = head_frame_model.to(device)
+    head_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu)
+    head_model = head_model.to(device)
 
-    tail_frame_model = Glow(3, args.n_flow // 32, args.n_block, affine=args.affine, conv_lu=not args.no_lu, nc_ctx=3)
-    tail_frame_model = tail_frame_model.to(device)
+    tail_model = Glow(3, args.n_flow // 32, args.n_block, affine=args.affine, conv_lu=not args.no_lu, nc_ctx=3)
+    tail_frame_model = tail_model.to(device)
 
     ctx_proc = ContextProcessor(3, 16)
 
-    # TODO load models from save on request
+    head_optimizer = optim.Adam(head_model.parameters(), lr=args.lr)
+    tail_optimizer = optim.Adam(list(tail_frame_model.parameters()) + list(ctx_proc.parameters()), lr=args.lr)
+
     if args.restore:
         print('Restoring from save!')
-        head_frame_model.load_state_dict(torch.load(f'checkpoint/headmodel.pt'))
-        tail_frame_model.load_state_dict(torch.load(f'checkpoint/tailmodel.pt'))
-        ctx_proc.load_state_dict(torch.load(f'checkpoint/ctxmodel.pt'))
+        restore_models_optimizers_from_save(head_model, tail_model, ctx_proc, head_optimizer, tail_optimizer)
 
-
-    train(args, head_frame_model, tail_frame_model, ctx_proc, n_epochs=args.epochs, max_examples=args.max_examples)
+    train(args, head_model, tail_frame_model, ctx_proc, head_optimizer, tail_optimizer, n_epochs=args.epochs, max_examples=args.max_examples)
 
     alert.write('glowtrain.py: Finished training')

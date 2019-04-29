@@ -4,12 +4,13 @@ import numpy as np
 import os
 from torch.utils.data import Dataset, DataLoader
 from random import shuffle
+import random
 from tqdm import tqdm
 
 
 class MomentsInTimeDataset(Dataset):
     def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None,
-                 single_example=False, transform=None):
+                 single_example=False, transform=None, seed=1234):
         """Dataset class loads the Moments in Time dataset, and dispenses (label, frames)
         examples."""
         super().__init__()
@@ -36,7 +37,10 @@ class MomentsInTimeDataset(Dataset):
                 # for each .mp4 file, add to list of examples
                 if file.endswith('.mp4'):
                     self.examples.append((label, os.path.join(dirName, file)))
-        # randomize
+
+        # randomize with seed
+        if seed is not None:
+            random.seed(seed)
         shuffle(self.examples)
 
         self.single_frames, self.single_label = None, None
@@ -45,6 +49,22 @@ class MomentsInTimeDataset(Dataset):
             print('filename: %s' % file)
             self.single_label = np.array(self.labels[label], dtype=np.int)
             self.single_frames = self.load_frames(file)
+
+    def split(self, fraction=0.8, max_examples=None):
+        """Split dataset into two datasets, where the first dataset has fraction of the data and second
+        dataset has 1 - fraction of the data. For example, training and validation datasets."""
+        # TODO check if this function works as intended
+        new_ds = MomentsInTimeDataset(self.data_dir, max_timesteps=self.max_timesteps, width=self.width, height=self.height,
+                                      channels=self.channels, max_examples=max_examples, single_example=self.single_example,
+                                      transform=self.transform)
+        n_examples = len(self)
+        n_first = int(n_examples * fraction)
+
+        # distribute examples between this dataset and the new dataset
+        new_ds.examples = self.examples[n_first:]
+        self.examples = self.examples[:n_first]
+        return new_ds
+
 
     def __len__(self):
         if self.max_examples is None:
@@ -125,14 +145,28 @@ def write_video(filename, data):
 
 
 if __name__ == '__main__':
+
+    def ds_stats(ds):
+        print(ds.labels)
+        print('Num examples: %s' % len(ds.examples))
+        label, frames = ds[0]
+        print('Label shape: %s' % str(label.shape))
+        print('Frames shape: %s' % str(frames.shape))
+        print('Frames mean: %s' % np.mean(frames))
+        print('Frames std: %s' % np.std(frames))
+        print()
+
+    print('Total set statistics')
     ds = MomentsInTimeDataset('../data/momentsintime/training')
-    print(ds.labels)
-    print('Num examples: %s' % len(ds.examples))
-    label, frames = ds[0]
-    print('Label shape: %s' % str(label.shape))
-    print('Frames shape: %s' % str(frames.shape))
-    print('Frames mean: %s' % np.mean(frames))
-    print('Frames std: %s' % np.std(frames))
+    ds_stats(ds)
+    val_ds = ds.split(0.9)
+    train_ds = ds
+
+    print('Training set statistics')
+    ds_stats(train_ds)
+
+    print('Validation set statistics')
+    ds_stats(val_ds)
 
     dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=5)
     for batch in tqdm(dl):
