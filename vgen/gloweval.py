@@ -4,7 +4,8 @@ import torch.nn as nn
 import argparse
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from vgen.glowtrain import Glow, calc_loss
+from vgen.glowtrain import calc_loss, calc_video_loss
+from vgen.glowmodel import Glow, ContextProcessor
 from vgen.videods import MomentsInTimeDataset
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -25,26 +26,41 @@ parser.add_argument('--path', metavar='PATH', type=str, help='Path to image dire
 parser.add_argument('--video_path', metavar='PATH', type=str, help='Where to save generated video samples')
 parser.add_argument('--n_frames', default=90, type=int, help='max number of video frames')
 parser.add_argument('--max_examples', default=None, type=int, help='max number of examples to train on')
+parser.add_argument('--use_state', default=False, action='store_true', help='if true, allow state info to pass between frames')
+parser.add_argument('--use_label', default=False, action='store_true', help='if true, allow state info to pass between frames')
 
 args = parser.parse_args()
 
-head_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu)
-head_model = head_model.to(device)
-head_model.eval()
+head_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
+                  act_norm_init=True)
+head_model.to(device)
+head_model.train()
 
-tail_model = Glow(3, args.n_flow // 32, args.n_block, affine=args.affine, conv_lu=not args.no_lu, nc_ctx=3)
-tail_model = tail_model.to(device)
-tail_model.eval()
+# number of channels for context to glow - we use a context processor to give frame info to tail glow
+nc_context_for_tail = 3 if args.use_state is False else 3 + 16
+
+# this model generates all subsequent frames, or "tail" frames
+tail_model = Glow(3, args.n_flow // 32, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
+                  nc_ctx=nc_context_for_tail, act_norm_init=True)
+tail_model.to(device)
+tail_model.train()
+
+# this model processes all previous frames as context for next-frame generation
+ctx_proc = ContextProcessor(3, 16)
+ctx_proc.to(device)
+ctx_proc.train()
 
 # restore models from save
 if args.restore:
     print('Restoring from save!')
     head_model.load_state_dict(torch.load(f'checkpoint/headmodel.pt'))
     tail_model.load_state_dict(torch.load(f'checkpoint/tailmodel.pt'))
+    ctx_proc.load_state_dict(torch.load(f'checkpoint/ctxmodel.pt'))
 
 ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=args.max_examples, seed=1212)
-val_ds = ds.split(0.999) # grab .1% of examples as validation set
-dl = DataLoader(val_ds, batch_size=args.batch, num_workers=3)
+val_ds = ds.split(0.001) # grab .1% of examples as validation set
+dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
+# TODO evaluate on validation set
 #print('Len validation dataset: %s' % len(val_ds))
 
 down_x = 256 // args.img_size
@@ -56,31 +72,25 @@ pbar = tqdm(dl)
 frame_losses = []
 im_losses = []  # first frame loss
 
+# TODO make this a args param
+n_frames=30
+
 with torch.no_grad():
     for batch_idx, batch in enumerate(pbar):
         batch = [t.to(device) for t in batch]
 
         # preprocess frames
         label, frames = batch
+        frames = frames[:, :n_frames]
         frames = frames - 0.5
         frames = torch.stack([downsample(frames[:, i]) for i in range(frames.shape[1])], 1)
-
+        assert frames.shape[1] == 30
         im = frames[:, 0]
         # calculate first frame loss
         log_p, logdet = head_model(im + torch.rand_like(im) / n_bins)
         loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
         # calculate loss for all frames
-        losses = []
-        for j in range(frames.shape[1] - 1):
-            prev_frame = frames[:, j]
-            frame = frames[:, j+1]
-            delta = frame - prev_frame
-            # calculate tail frame loss
-            frame_log_p, frame_logdet = tail_model(delta + torch.rand_like(frame) / n_bins, ctx=prev_frame)
-            frame_loss, frame_log_p, frame_log_det = calc_loss(frame_log_p, frame_logdet, args.img_size, n_bins)
-            losses.append(frame_loss)
-
-        total_loss = torch.stack(losses, dim=0).mean()
+        total_loss = calc_video_loss(tail_model, ctx_proc, frames, n_bins)
         frame_losses.append(total_loss)
         im_losses.append(loss)
 

@@ -9,13 +9,13 @@ logabs = lambda x: torch.log(torch.abs(x))
 
 
 class ActNorm(nn.Module):
-    def __init__(self, in_channel, logdet=True):
+    def __init__(self, in_channel, logdet=True, initialized = False):
         super().__init__()
 
         self.loc = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
         self.scale = nn.Parameter(torch.ones(1, in_channel, 1, 1))
 
-        self.initialized = False
+        self.initialized = initialized
         self.logdet = logdet
 
     def initialize(self, input):
@@ -232,10 +232,10 @@ class AffineCoupling(nn.Module):
 
 
 class Flow(nn.Module):
-    def __init__(self, in_channel, affine=True, conv_lu=True, nc_ctx=0):
+    def __init__(self, in_channel, affine=True, conv_lu=True, nc_ctx=0, act_norm_init=False):
         super().__init__()
 
-        self.actnorm = ActNorm(in_channel)
+        self.actnorm = ActNorm(in_channel, initialized=act_norm_init)
 
         if conv_lu:
             self.invconv = InvConv2dLU(in_channel)
@@ -292,14 +292,14 @@ def unsqueeze_image(input):
     return unsqueezed
 
 class Block(nn.Module):
-    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True, nc_ctx=0):
+    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True, nc_ctx=0, act_norm_init=False):
         super().__init__()
 
         squeeze_dim = in_channel * 4
 
         self.flows = nn.ModuleList()
         for i in range(n_flow):
-            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx))
+            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx, act_norm_init=act_norm_init))
 
         self.split = split
 
@@ -358,7 +358,17 @@ class Block(nn.Module):
 
 
 class Glow(nn.Module):
-    def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True, nc_ctx=0):
+    def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True, nc_ctx=0, act_norm_init=False):
+        """
+
+        :param in_channel:
+        :param n_flow:
+        :param n_block:
+        :param affine:
+        :param conv_lu:
+        :param nc_ctx:
+        :param act_norm_init: actnorm is initialized - if False, initialize it from first batch (True for restore)
+        """
         super().__init__()
         if nc_ctx > 0:
             self.ctx_downs = nn.ModuleList(
@@ -369,9 +379,9 @@ class Glow(nn.Module):
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
-            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx * 4))
+            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx * 4, act_norm_init=act_norm_init))
             n_channel *= 2
-        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine, nc_ctx=nc_ctx * 4))
+        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine, nc_ctx=nc_ctx * 4, act_norm_init=act_norm_init))
 
     def build_ctx_pyramid(self, ctx):
         # construct a pyramid from input context
@@ -422,11 +432,13 @@ class Glow(nn.Module):
 
 class ContextProcessor(nn.Module):
     def __init__(self, nc_frame, nc_state):
+        """Special module that reads frame by frame to capture context. This context is then fed
+        into the glow at each step to incorporate context."""
         super().__init__()
-        self.conv1 = nn.Conv2d(nc_frame + nc_state, nc_state, 3, stride=1, padding=2, dilation=1)
-        self.conv2 = nn.Conv2d(nc_state, nc_state, 3, stride=1, padding=2, dilation=1)
+        self.nc_state = nc_state
+        self.conv1 = nn.Conv2d(nc_frame + nc_state, nc_state * 2, 3, stride=1, padding=1, dilation=1)
+        self.conv2 = nn.Conv2d(nc_state * 2, nc_state, 3, stride=1, padding=2, dilation=2)
         self.relu = nn.ReLU()
-
 
     def forward(self, frame, state):
         """Process frame and state into new state."""
