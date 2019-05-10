@@ -5,7 +5,7 @@ import argparse
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from vgen.glowtrain import calc_loss, calc_video_loss
-from vgen.glowmodel import Glow, ContextProcessor
+from vgen.glowmodel import Glow, LabelGlow, ContextProcessor
 from vgen.videods import MomentsInTimeDataset
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -24,15 +24,31 @@ parser.add_argument('--temp', default=0.7, type=float, help='temperature of samp
 parser.add_argument('--n_sample', default=20, type=int, help='number of samples')
 parser.add_argument('--path', metavar='PATH', type=str, help='Path to image directory')
 parser.add_argument('--video_path', metavar='PATH', type=str, help='Where to save generated video samples')
-parser.add_argument('--n_frames', default=90, type=int, help='max number of video frames')
+parser.add_argument('--n_frames', default=30, type=int, help='max number of video frames')
 parser.add_argument('--max_examples', default=None, type=int, help='max number of examples to train on')
 parser.add_argument('--use_state', default=False, action='store_true', help='if true, allow state info to pass between frames')
 parser.add_argument('--use_label', default=False, action='store_true', help='if true, allow state info to pass between frames')
+parser.add_argument('--train', default=False, action='store_true', help='if true, evaluate on training examples')
 
 args = parser.parse_args()
 
-head_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
-                  act_norm_init=True)
+# we pick a seed of 1212 arbitrarily, but match it with the train script to ensure even split
+ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=args.max_examples, seed=100)
+
+n_labels = len(ds.labels)
+
+if args.train:
+    val_ds = ds.split(0.001) # grab .1% of examples as validation set
+    dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
+else:
+    # evaluate on validation examples
+    val_ds = ds.split(0.999)
+    dl = DataLoader(val_ds, batch_size=args.batch, num_workers=3)
+
+print('Number of batches to evaluate: %s' % len(dl))
+
+head_model = LabelGlow(n_labels, args.img_size, 3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
+                nc_ctx=3 if args.use_label else 0)
 head_model.to(device)
 head_model.train()
 
@@ -41,12 +57,12 @@ nc_context_for_tail = 3 if args.use_state is False else 3 + 16
 
 # this model generates all subsequent frames, or "tail" frames
 tail_model = Glow(3, args.n_flow // 32, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
-                  nc_ctx=nc_context_for_tail, act_norm_init=True)
+                  nc_ctx=nc_context_for_tail)
 tail_model.to(device)
 tail_model.train()
 
 # this model processes all previous frames as context for next-frame generation
-ctx_proc = ContextProcessor(3, 16)
+ctx_proc = ContextProcessor(3, 16, args.n_frames)
 ctx_proc.to(device)
 ctx_proc.train()
 
@@ -57,12 +73,6 @@ if args.restore:
     tail_model.load_state_dict(torch.load(f'checkpoint/tailmodel.pt'))
     ctx_proc.load_state_dict(torch.load(f'checkpoint/ctxmodel.pt'))
 
-ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=args.max_examples, seed=1212)
-val_ds = ds.split(0.001) # grab .1% of examples as validation set
-dl = DataLoader(ds, batch_size=args.batch, num_workers=3)
-# TODO evaluate on validation set
-#print('Len validation dataset: %s' % len(val_ds))
-
 down_x = 256 // args.img_size
 downsample = nn.AvgPool2d(down_x, stride=down_x, padding=0).to(device)
 n_bins = 2. ** args.n_bits
@@ -72,22 +82,20 @@ pbar = tqdm(dl)
 frame_losses = []
 im_losses = []  # first frame loss
 
-# TODO make this a args param
-n_frames=30
-
 with torch.no_grad():
     for batch_idx, batch in enumerate(pbar):
         batch = [t.to(device) for t in batch]
 
         # preprocess frames
         label, frames = batch
-        frames = frames[:, :n_frames]
+        label = label if args.use_label else None
+        frames = frames[:, :args.n_frames]
         frames = frames - 0.5
         frames = torch.stack([downsample(frames[:, i]) for i in range(frames.shape[1])], 1)
         assert frames.shape[1] == 30
         im = frames[:, 0]
         # calculate first frame loss
-        log_p, logdet = head_model(im + torch.rand_like(im) / n_bins)
+        log_p, logdet = head_model(im + torch.rand_like(im) / n_bins, label=label)
         loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
         # calculate loss for all frames
         total_loss = calc_video_loss(tail_model, ctx_proc, frames, n_bins)

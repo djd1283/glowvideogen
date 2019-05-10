@@ -8,14 +8,64 @@ from scipy import linalg as la
 logabs = lambda x: torch.log(torch.abs(x))
 
 
+# class ActNorm(nn.Module):
+#     def __init__(self, in_channel, logdet=True, initialized = False):
+#         super().__init__()
+#
+#         self.loc = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
+#         self.scale = nn.Parameter(torch.ones(1, in_channel, 1, 1))
+#
+#         self.initialized = initialized
+#         self.logdet = logdet
+#
+#     def initialize(self, input):
+#         with torch.no_grad():
+#             flatten = input.permute(1, 0, 2, 3).contiguous().view(input.shape[1], -1)
+#             mean = (
+#                 flatten.mean(1)
+#                 .unsqueeze(1)
+#                 .unsqueeze(2)
+#                 .unsqueeze(3)
+#                 .permute(1, 0, 2, 3)
+#             )
+#             std = (
+#                 flatten.std(1)
+#                 .unsqueeze(1)
+#                 .unsqueeze(2)
+#                 .unsqueeze(3)
+#                 .permute(1, 0, 2, 3)
+#             )
+#
+#             self.loc.data.copy_(-mean)
+#             self.scale.data.copy_(1 / (std + 1e-6))
+#
+#     def forward(self, input):
+#         _, _, height, width = input.shape
+#
+#         if not self.initialized:
+#             self.initialize(input)
+#             self.initialized = True
+#
+#         log_abs = logabs(self.scale)
+#
+#         logdet = height * width * torch.sum(log_abs)
+#
+#         if self.logdet:
+#             return self.scale * (input + self.loc), logdet
+#
+#         else:
+#             return self.scale * (input + self.loc)
+#
+#     def reverse(self, output):
+#         return output / self.scale - self.loc
 class ActNorm(nn.Module):
-    def __init__(self, in_channel, logdet=True, initialized = False):
+    def __init__(self, in_channel, logdet=True, trainable=True):
         super().__init__()
 
-        self.loc = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
-        self.scale = nn.Parameter(torch.ones(1, in_channel, 1, 1))
+        self.loc = nn.Parameter(torch.zeros(1, in_channel, 1, 1), requires_grad=trainable)
+        self.scale = nn.Parameter(torch.ones(1, in_channel, 1, 1), requires_grad=trainable)
 
-        self.initialized = initialized
+        self.register_buffer('initialized', torch.tensor(0, dtype=torch.uint8))
         self.logdet = logdet
 
     def initialize(self, input):
@@ -42,9 +92,9 @@ class ActNorm(nn.Module):
     def forward(self, input):
         _, _, height, width = input.shape
 
-        if not self.initialized:
+        if self.initialized.item() == 0:
             self.initialize(input)
-            self.initialized = True
+            self.initialized.fill_(1)
 
         log_abs = logabs(self.scale)
 
@@ -232,10 +282,10 @@ class AffineCoupling(nn.Module):
 
 
 class Flow(nn.Module):
-    def __init__(self, in_channel, affine=True, conv_lu=True, nc_ctx=0, act_norm_init=False):
+    def __init__(self, in_channel, affine=True, conv_lu=True, nc_ctx=0):
         super().__init__()
 
-        self.actnorm = ActNorm(in_channel, initialized=act_norm_init)
+        self.actnorm = ActNorm(in_channel)
 
         if conv_lu:
             self.invconv = InvConv2dLU(in_channel)
@@ -292,14 +342,14 @@ def unsqueeze_image(input):
     return unsqueezed
 
 class Block(nn.Module):
-    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True, nc_ctx=0, act_norm_init=False):
+    def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True, nc_ctx=0):
         super().__init__()
 
         squeeze_dim = in_channel * 4
 
         self.flows = nn.ModuleList()
         for i in range(n_flow):
-            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx, act_norm_init=act_norm_init))
+            self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx))
 
         self.split = split
 
@@ -358,7 +408,7 @@ class Block(nn.Module):
 
 
 class Glow(nn.Module):
-    def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True, nc_ctx=0, act_norm_init=False):
+    def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True, nc_ctx=0):
         """
 
         :param in_channel:
@@ -379,9 +429,9 @@ class Glow(nn.Module):
         self.blocks = nn.ModuleList()
         n_channel = in_channel
         for i in range(n_block - 1):
-            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx * 4, act_norm_init=act_norm_init))
+            self.blocks.append(Block(n_channel, n_flow, affine=affine, conv_lu=conv_lu, nc_ctx=nc_ctx * 4))
             n_channel *= 2
-        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine, nc_ctx=nc_ctx * 4, act_norm_init=act_norm_init))
+        self.blocks.append(Block(n_channel, n_flow, split=False, affine=affine, nc_ctx=nc_ctx * 4))
 
     def build_ctx_pyramid(self, ctx):
         # construct a pyramid from input context
@@ -423,19 +473,56 @@ class Glow(nn.Module):
             ctx_in = None if ctx is None else ctx_pyramid[i]
             if i == 0:
                 input = block.reverse(z_list[-1], z_list[-1], ctx=ctx_in)
-
             else:
                 input = block.reverse(input, z_list[-(i + 1)], ctx=ctx_in)
 
         return input
 
 
+class LabelGlow(nn.Module):
+    def __init__(self, n_labels, img_size, in_channel, n_flow, n_block, affine=True, conv_lu=True, nc_ctx=3):
+        super().__init__()
+        """This class adds the ability to condition on label information, where the label is an index into n_labels."""
+        self.nc_ctx = nc_ctx
+        self.glow = Glow(in_channel, n_flow, n_block, affine, conv_lu, nc_ctx)
+        self.l_embs = nn.Parameter(torch.randn(n_labels, 3, img_size, img_size), requires_grad=True)
+
+    def forward(self, input, label=None, ctx=None):
+        if self.nc_ctx > 0:
+            if ctx is not None and label is not None:
+                ctx_in = torch.cat([ctx, self.l_embs[label]], 1)
+            elif ctx is not None:
+                ctx_in = ctx
+            elif label is not None:
+                ctx_in = self.l_embs[label]
+            else:
+                ctx_in = None
+        else:
+            ctx_in = None
+        return self.glow(input, ctx=ctx_in)
+
+    def reverse(self, z_list, label=None, ctx=None):
+        if self.nc_ctx > 0:
+            if ctx is not None and label is not None:
+                ctx_in = torch.cat([ctx, self.l_embs[label]], 1)
+            elif ctx is not None:
+                ctx_in = ctx
+            elif label is not None:
+                ctx_in = self.l_embs[label]
+            else:
+                ctx_in = None
+        else:
+            ctx_in = None
+        return self.glow.reverse(z_list, ctx=ctx_in)
+
+
 class ContextProcessor(nn.Module):
-    def __init__(self, nc_frame, nc_state):
+    def __init__(self, nc_frame, nc_state, n_frames):
         """Special module that reads frame by frame to capture context. This context is then fed
         into the glow at each step to incorporate context."""
         super().__init__()
         self.nc_state = nc_state
+        self.norms = nn.ModuleList([ActNorm(nc_state, trainable=False, logdet=False) for _ in range(n_frames - 1)])
         self.conv1 = nn.Conv2d(nc_frame + nc_state, nc_state * 2, 3, stride=1, padding=1, dilation=1)
         self.conv2 = nn.Conv2d(nc_state * 2, nc_state, 3, stride=1, padding=2, dilation=2)
         self.relu = nn.ReLU()

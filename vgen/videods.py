@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 class MomentsInTimeDataset(Dataset):
     def __init__(self, data_dir, max_timesteps=90, width=256, height=256, channels=3, max_examples=None,
-                 single_example=False, transform=None, seed=1234):
+                 single_example=False, transform=None, seed=1234, single_label=None):
         """Dataset class loads the Moments in Time dataset, and dispenses (label, frames)
         examples."""
         super().__init__()
@@ -27,16 +27,21 @@ class MomentsInTimeDataset(Dataset):
 
         self.examples = []
         # load dataset
+        labels = []
         for dirName, subdirList, fileList in os.walk(data_dir):
             # go through all label directories
             # skip parent data directory
             # parent folder becomes name of class
             label = os.path.basename(dirName)
-            self.labels[label] = len(self.labels) # O(1) mapping from label to index
-            for file in fileList:
-                # for each .mp4 file, add to list of examples
-                if file.endswith('.mp4'):
-                    self.examples.append((label, os.path.join(dirName, file)))
+            labels.append(label)
+            if single_label is None or label == single_label:
+                for file in fileList:
+                    # for each .mp4 file, add to list of examples
+                    if file.endswith('.mp4'):
+                        self.examples.append((label, os.path.join(dirName, file)))
+        labels.sort()
+        self.labels = {labels[i]: i for i in range(len(labels))}  # mapping from label to index, poorly named
+        self.index_to_label = {v: k for k,v in self.labels.items()}  # reverse mapping from index to label
 
         # randomize with seed
         if seed is not None:

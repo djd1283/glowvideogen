@@ -16,7 +16,7 @@ from torch.autograd import Variable, grad
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms, utils
 
-from vgen.glowmodel import Glow, ContextProcessor
+from vgen.glowmodel import Glow, LabelGlow, ContextProcessor
 from vgen.videods import MomentsInTimeDataset, write_video
 from tensorboard_logger import log_value, configure
 from tgalert import TelegramAlert
@@ -56,6 +56,8 @@ parser.add_argument('--use_label', default=False, action='store_true', help='if 
 
 
 args = parser.parse_args()
+
+i = None
 
 # SET TEMPERATURE TO 1 WHEN MODELLING ONLY ONE IMAGE - IT SHOULD BE AT THE CENTER
 
@@ -115,48 +117,84 @@ def calc_loss(log_p, logdet, image_size, n_bins):
     )
 
 
-def generate_image(model, l_embs, img_size, n_flow, n_block, n_sample, temp=0.7, label=None, ctx=None):
+def calc_num_trainable_params(params):
+    model_parameters = filter(lambda p: p.requires_grad, params)
+    num_params = sum([np.prod(p.size()) for p in model_parameters])
+    return num_params
+
+def calc_grad_std_params(params):
+    model_parameters = filter(lambda p: p.requires_grad, params)
+    squared_sum = sum((p.data ** 2).sum().item() for p in model_parameters)
+    return np.sqrt(squared_sum)
+
+def generate_image(model, img_size, n_flow, n_block, n_sample, temp=0.7, ctx=None, label=None):
     """Generate a single image from a Glow model."""
     # Determine sizes of each layer
+
     z_sample = []
     z_shapes = calc_z_shapes(3, img_size, n_flow, n_block)
     for z in z_shapes:
         z_new = torch.randn(n_sample, *z) * temp
         z_sample.append(z_new.to(device))
-    return model.reverse(z_sample, ctx=ctx)
+
+    assert ctx is None or label is None  # can either insert label or context
+    if label is not None:
+        return model.reverse(z_sample, label=label)
+    else:
+        # handles both cases where only context is provided or no label or context is provided
+        return model.reverse(z_sample, ctx=ctx)
 
 
-def generate_video(head_model, tail_model, ctx_proc, l_embs, n_frames, img_size, n_flow, n_block, temp=0.7, label=None):
+def generate_video(head_model, tail_model, ctx_proc, n_frames, img_size, n_flow, n_block, temp=0.7, label=None):
     """Generate video frame by frame, each frame conditioned on the previous frame only"""
-    image = generate_image(head_model, l_embs, img_size, n_flow, n_block, 1, temp, label=label)
+    # lookup label embeddings as input to model
+
+    image = generate_image(head_model, img_size, n_flow, n_block, 1, temp, label=label)
     frames = [image]
     state = torch.zeros(1, ctx_proc.nc_state, img_size, img_size).to(device)
-    for i in range(n_frames-1):
+    for j in range(n_frames-1):
         prev_frame = frames[-1]
         ctx=prev_frame
         if args.use_state:
             # produce new state given the previous frame
             state = ctx_proc(prev_frame, state)
+            state = ctx_proc.norms[j](state)  # normalize each state across all frames
             # add state to context for glow to generate from
             ctx = torch.cat([ctx, state], dim=1)
 
-        frame = generate_image(tail_model, l_embs, img_size, n_flow // 32, n_block, 1, temp, ctx=ctx)
+        frame = generate_image(tail_model, img_size, n_flow // 32, n_block, 1, temp, ctx=ctx)
         #frame = frames[-1] + delta
         frames.append(frame)
     result = torch.stack(frames, dim=1).squeeze(0)
     return result
 
 
-def train_on_first_frame(model, l_embs, im, label, optimizer, n_bins):
-    log_p, logdet = model(im + torch.rand_like(im) / n_bins)
+def train_on_first_frame(model, im, label, optimizer, n_bins):
+    """
+    Train glow to maximize probability for first frame of videos.
+    :param model:
+    :param l_embs: (n_labels, nc, img_size, img_size)
+    :param im: (batch_size, 3, img_size, img_size
+    :param label: (batch_size,)
+    :param optimizer: optimizer to step parameters
+    :param n_bins: resolution of pixel storage
+    :return:
+    """
+    log_p, logdet = model(im + torch.rand_like(im) / n_bins, label=label)
     loss, log_p, log_det = calc_loss(log_p, logdet, args.img_size, n_bins)
     model.zero_grad()
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 50)  # 100 times the parameters, 10 times the norm
+    log_value('norm', norm, i)
+    if model.l_embs.grad is not None:
+        log_value('label_emb_std', model.l_embs.data.std().item(), i)
+        log_value('label_emb_grad_std', model.l_embs.grad.std().item(), i)
+        log_value('label_emb_grad_norm', model.l_embs.grad.norm(). item(), i)
     optimizer.step()
     return loss, log_p, log_det
 
 
-def calc_video_loss(tail_model, ctx_proc, frames, n_bins):
+def calc_video_loss(tail_model, ctx_proc, frames, n_bins, log_values=False):
     batch_size, n_frames, nc, h, w = frames.shape
     state = torch.zeros(batch_size, ctx_proc.nc_state, h, w).to(frames.device)
     losses = []
@@ -170,6 +208,11 @@ def calc_video_loss(tail_model, ctx_proc, frames, n_bins):
         if args.use_state:
             # produce new state given the previous frame
             state = ctx_proc(prev_frame, state)
+            state = ctx_proc.norms[j](state)  # normalize each state across all frames
+            if j == 1 and log_values:
+                log_value('ctx_std_start', state.std().item(), i)
+            if j == frames.shape[1] - 2 and log_values:
+                log_value('ctx_std_end', state.std().item(), i)
             # add state to context for glow to generate from
             ctx = torch.cat([ctx, state], dim=1)
 
@@ -180,7 +223,7 @@ def calc_video_loss(tail_model, ctx_proc, frames, n_bins):
     return total_loss
 
 
-def train_on_video(head_model, tail_model, ctx_proc, l_embs, frames, label, head_optimizer, tail_optimizer, n_bins):
+def train_on_video(head_model, tail_model, ctx_proc, frames, label, head_optimizer, tail_optimizer, n_bins):
     """
     Train glow to generate all frames of a video
     :param head_model: this Glow model generates the first frame of a video
@@ -191,12 +234,16 @@ def train_on_video(head_model, tail_model, ctx_proc, l_embs, frames, label, head
     :return: calculated loss for video, followed by gaussian log probability and log determinant
     """
     # train on first frame first
-    first_loss, first_log_p, first_log_det = train_on_first_frame(head_model, l_embs, frames[:, 0],
+    first_loss, first_log_p, first_log_det = train_on_first_frame(head_model, frames[:, 0],
                                                                   label, head_optimizer, n_bins)
     # now train the rest of the frames as one step
     tail_optimizer.zero_grad()
-    total_loss = calc_video_loss(tail_model, ctx_proc, frames, n_bins)
+    total_loss = calc_video_loss(tail_model, ctx_proc, frames, n_bins, log_values=True)
     total_loss.backward()
+    tail_norm = torch.nn.utils.clip_grad_norm_(tail_model.parameters(), 5)
+    ctx_norm = torch.nn.utils.clip_grad_norm_(ctx_proc.parameters(), 5)
+    log_value('video_norm', tail_norm, i)
+    log_value('ctx_norm', ctx_norm, i)
     tail_optimizer.step()
 
     return total_loss, first_loss, first_log_p, first_log_det
@@ -211,7 +258,7 @@ def restore_models_optimizers_from_save(head_model, tail_model, ctx_proc, head_o
     tail_optim.load_state_dict(torch.load('checkpoint/tail_optim.pt'))
 
 
-def train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, tail_optimizer, n_epochs=1, n_frames=30):
+def train(args, ds, head_model, tail_model, ctx_proc, head_optimizer, tail_optimizer, n_epochs=1, n_frames=30):
     """Head model produces the first frame of the video. Tail model produces the rest of the frames."""
     # Load dataset of images
     #dataset = iter(sample_data(args.path, args.batch, args.img_size))
@@ -219,10 +266,12 @@ def train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, ta
     down_x = 256 // args.img_size
     downsample = nn.AvgPool2d(down_x, stride=down_x, padding=0).to(device)
     n_bins = 2. ** args.n_bits
+    inf = float('inf')
     head_model.train()
     tail_model.train()
     ctx_proc.train()
-
+    global i  # we keep the iteration number as a global variable, to allow logging values anywhere
+    i = 0
     img_count=0
     pbar = tqdm(total=n_epochs * len(dl))
     for epoch_idx in range(n_epochs):
@@ -233,9 +282,8 @@ def train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, ta
             #image_old = image_old.to(device)
             batch = [t.to(device) for t in batch]
             label, frames = batch
+            label = label if args.use_label else None
             frames = frames[:, :n_frames]
-
-
             frames = frames - 0.5 # normalize to range (-0.5, +0.5)
             # downsample all frames to make them easier to generate
             frames = torch.stack([downsample(frames[:, i]) for i in range(frames.shape[1])], 1)
@@ -246,9 +294,10 @@ def train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, ta
             image = frames[:, 0]
 
             #TODO condition on label features
+            #TODO add DNI to train on longer videos
 
-            video_loss, loss, log_p, log_det = train_on_video(head_model, tail_model, ctx_proc, l_embs, frames, label,
-                                                              head_optimizer, tail_optimizer, n_bins)
+            video_loss, loss, log_p, log_det\
+                = train_on_video(head_model, tail_model, ctx_proc, frames, label, head_optimizer, tail_optimizer, n_bins)
             #loss, log_p, log_det = train_on_first_frame(head_model, image, head_optimizer, n_bins)
 
             log_value('loss', loss.item(), i)
@@ -268,18 +317,24 @@ def train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, ta
                     head_model.eval()
                     tail_model.eval()
                     ctx_proc.eval()
-                    gen_image = generate_image(head_model, l_embs, args.img_size, args.n_flow, args.n_block, args.n_sample,
-                                               args.temp)
+                    sample_label = torch.randint(0, n_labels, (args.n_sample,)) if args.use_label else None
+                    # TODO fix ctx versus label problem
+                    gen_image = generate_image(head_model, args.img_size, args.n_flow, args.n_block, args.n_sample,
+                                               args.temp, label=sample_label)
                     gen_image = gen_image.cpu()
 
                     if args.video_path is not None:
-                        gen_video = generate_video(head_model, tail_model, ctx_proc, l_embs, n_frames, args.img_size,
-                                                   args.n_flow, args.n_block, args.temp)
+                        sample_label = torch.randint(0, n_labels, (1,))  # generate images from label
+                        gen_video = generate_video(head_model, tail_model, ctx_proc, n_frames, args.img_size,
+                                                   args.n_flow, args.n_block, args.temp, label=sample_label)
                         gen_video = np.transpose(gen_video.cpu().numpy(), [0, 2, 3, 1])
                         gen_video = ((gen_video + 0.5) * 256.0)
                         gen_video = gen_video.clip(0, 255).astype(np.uint8)
                         # Save all generated video samples to disk
                         write_video(os.path.join(args.video_path, 'video_' + str(img_count) + '.mp4'), gen_video)
+                        with open(os.path.join(args.video_path, 'video_' + str(img_count) + '.txt'), 'w') as f:
+                            # write the video label for reference
+                            f.write('label: %s\n' % str(ds.index_to_label[sample_label.item()]))
 
                     utils.save_image(
                         gen_image,
@@ -298,18 +353,19 @@ def train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, ta
                     img_count += 1
 
             if i % 100 == 99:
-                # NaN fail-safe: if we detect Nan loss, restore previous checkpoint
+                # NaN fail-safe: if we detect Nan or inf loss, restore previous checkpoint
                 # NaN occurs every so often (once after two hours, or not at all) due to numerical instability (division, log, etc.)
-                if loss.item() != loss.item() or video_loss.item() != video_loss.item():
+                if loss.item() != loss.item() or video_loss.item() != video_loss.item() or loss.abs().item() == inf:
                     alert.write('glowtrain.py: NaN detected! Restoring last save')
                     restore_models_optimizers_from_save(head_model, tail_model, ctx_proc, head_optimizer,
                                                         tail_optimizer)
-                pbar.write("Saving model")
-                torch.save(head_model.state_dict(), 'checkpoint/headmodel.pt')
-                torch.save(tail_model.state_dict(), 'checkpoint/tailmodel.pt')
-                torch.save(ctx_proc.state_dict(), 'checkpoint/ctxmodel.pt')
-                torch.save(head_optimizer.state_dict(), 'checkpoint/head_optim.pt')
-                torch.save(tail_optimizer.state_dict(), 'checkpoint/tail_optim.pt')
+                else:
+                    pbar.write("Saving model. Loss: %s" % loss.item())
+                    torch.save(head_model.state_dict(), 'checkpoint/headmodel.pt')
+                    torch.save(tail_model.state_dict(), 'checkpoint/tailmodel.pt')
+                    torch.save(ctx_proc.state_dict(), 'checkpoint/ctxmodel.pt')
+                    torch.save(head_optimizer.state_dict(), 'checkpoint/head_optim.pt')
+                    torch.save(tail_optimizer.state_dict(), 'checkpoint/tail_optim.pt')
 
 if __name__ == '__main__':
     #print('Detecting NaN anomalies')
@@ -323,33 +379,36 @@ if __name__ == '__main__':
     if args.video_path is not None and not os.path.exists(args.video_path):
         os.makedirs(args.video_path)
 
-    # if video path specified, delete all video{number}.mp4s!!!!!! start from scratch each time
+    # if video path specified, delete all video* files!!!!!! start from scratch each time
     if args.video_path is not None:
-        [os.remove(f) for f in glob.glob(os.path.join(args.video_path, 'video*.mp4'))]
+        [os.remove(f) for f in glob.glob(os.path.join(args.video_path, 'video*'))]
 
     # create training and validation sets
-    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=args.max_examples, seed=1212)
-    val_ds = ds.split(0.9) # grab 10% of examples as validation set
+    ds = MomentsInTimeDataset('../data/momentsintime/training', max_examples=args.max_examples, seed=100, single_example=True, single_label='walking')
+    #val_ds = ds.split(0.9) # grab 10% of examples as validation set
     n_labels = len(ds.labels)
+    print('Number of labels: %s' % n_labels)
 
     # this model generates the first frame
-    head_model = Glow(3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
-                      act_norm_init=args.restore, nc_ctx=3 if args.use_label else 0)  # do not initialize act norm if restoring from save!
+    head_model = LabelGlow(n_labels, args.img_size, 3, args.n_flow, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
+                      nc_ctx=3 if args.use_label else 0)  # do not initialize act norm if restoring from save!
     head_model.to(device)
+    print('Head model # params: %s' % calc_num_trainable_params(head_model.parameters()))
+    print('Label emb # params: %s' % calc_num_trainable_params([head_model.l_embs]))
 
     # number of channels for context to glow - we use a context processor to give frame info to tail glow
     nc_context_for_tail = 3 if args.use_state is False else 3 + 16
 
-    l_embs = nn.Parameter(torch.randn(n_labels, args.img_size, args.img_size), requires_grad=True)
-
     # this model generates all subsequent frames, or "tail" frames
-    tail_model = Glow(3, args.n_flow // 32, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
-                      nc_ctx=nc_context_for_tail, act_norm_init=args.restore)
+    tail_model = Glow(3, args.n_flow // 16, args.n_block, affine=args.affine, conv_lu=not args.no_lu,
+                      nc_ctx=nc_context_for_tail)
     tail_model.to(device)
+    print('Tail model # params: %s' % calc_num_trainable_params(tail_model.parameters()))
 
     # this model processes all previous frames as context for next-frame generation
-    ctx_proc = ContextProcessor(3, 16)
+    ctx_proc = ContextProcessor(3, 16, args.n_frames)
     ctx_proc.to(device)
+    print('Context processor # params: %s' % calc_num_trainable_params(ctx_proc.parameters()))
 
     head_optimizer = optim.Adam(head_model.parameters(), lr=args.lr)
     tail_optimizer = optim.Adam(list(tail_model.parameters()) + list(ctx_proc.parameters()), lr=args.lr)
@@ -358,7 +417,7 @@ if __name__ == '__main__':
         print('Restoring from save!')
         restore_models_optimizers_from_save(head_model, tail_model, ctx_proc, head_optimizer, tail_optimizer)
 
-    train(args, ds, head_model, tail_model, ctx_proc, l_embs, head_optimizer, tail_optimizer,
-          n_epochs=args.epochs)
+    train(args, ds, head_model, tail_model, ctx_proc, head_optimizer, tail_optimizer,
+          n_epochs=args.epochs, n_frames=args.n_frames)
 
     alert.write('glowtrain.py: Finished training')
